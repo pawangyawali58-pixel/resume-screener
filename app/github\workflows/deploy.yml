@@ -1,0 +1,148 @@
+name: Build → ECR → Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app.py'
+      - 'screener.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/deploy.yml'
+
+env:
+  AWS_REGION:   us-east-1
+  ECR_REPO:     resume-screener        # must match var.project_name in Terraform
+  PROJECT_NAME: resume-screener
+
+jobs:
+  # ── Job 1: Run unit tests ──────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest flask flask-sqlalchemy
+
+      - name: Run tests
+        run: pytest test_app.py -v
+
+  # ── Job 2: Build Docker image and push to ECR ──────────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test                        # only runs if tests pass
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      ecr_url:   ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          # Tag with short git SHA for traceability — standard industry practice
+          TAG=$(echo $GITHUB_SHA | cut -c1-7)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Image tag will be: $TAG"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest \
+            .
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          echo "Pushed: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}"
+
+  # ── Job 3: SSH into EC2 and deploy the new image ───────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push             # only runs after image is in ECR
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Get EC2 public IP from AWS
+        id: ec2
+        run: |
+          # Fetch IP dynamically — no need to hardcode it as a secret
+          IP=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Project,Values=${{ env.PROJECT_NAME }}" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "EC2 IP: $IP"
+
+      - name: Deploy new image on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:        ${{ steps.ec2.outputs.ip }}
+          username:    ec2-user
+          key:         ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          timeout:     120s
+          script: |
+            # Authenticate Docker to ECR (EC2 uses IAM role — no keys needed)
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+              | docker login --username AWS --password-stdin \
+                ${{ needs.build-and-push.outputs.ecr_url }}
+
+            # Pull the latest image
+            docker pull ${{ needs.build-and-push.outputs.ecr_url }}/${{ env.ECR_REPO }}:latest
+
+            # Stop and remove old container gracefully
+            docker stop screener-app 2>/dev/null || true
+            docker rm   screener-app 2>/dev/null || true
+
+            # Start new container
+            docker run -d \
+              --name screener-app \
+              --restart always \
+              -p 5000:5000 \
+              -e DB_HOST=${{ secrets.DB_HOST }} \
+              -e DB_PORT=3306 \
+              -e DB_NAME=screenerdb \
+              -e DB_USER=root \
+              -e DB_PASS=${{ secrets.DB_PASS }} \
+              ${{ needs.build-and-push.outputs.ecr_url }}/${{ env.ECR_REPO }}:latest
+
+            # Verify container is running
+            sleep 5
+            docker ps | grep screener-app
+            echo "Deployment complete — image: ${{ needs.build-and-push.outputs.ecr_url }}/${{ env.ECR_REPO }}:${{ needs.build-and-push.outputs.image_tag }}"
