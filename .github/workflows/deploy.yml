@@ -4,12 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'app.py'
-      - 'screener.py'
-      - 'requirements.txt'
-      - 'Dockerfile'
-      - '.github/workflows/deploy.yml'
 
 env:
   AWS_REGION:   us-east-1

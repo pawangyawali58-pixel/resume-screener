@@ -25,6 +25,7 @@ class MockModel:
             setattr(self, k, v)
 
 mock_db.Model = MockModel
+
 sys.modules["flask_sqlalchemy"] = MagicMock(SQLAlchemy=MagicMock(return_value=mock_db))
 
 # Mock Prometheus so tests don't register metrics
