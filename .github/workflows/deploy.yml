@@ -36,7 +36,7 @@ jobs:
           pip install pytest flask flask-sqlalchemy
 
       - name: Run tests
-        run: pytest test_app.py -v
+        run: pytest app/test_app.py -v
 
   # ── Job 2: Build Docker image and push to ECR ──────────────────────────────
   build-and-push:
