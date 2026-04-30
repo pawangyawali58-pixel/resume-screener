@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  AWS_REGION:   us-east-1
+  AWS_REGION:   ap-south-1
   ECR_REPO:     resume-screener        # must match var.project_name in Terraform
   PROJECT_NAME: resume-screener
 
